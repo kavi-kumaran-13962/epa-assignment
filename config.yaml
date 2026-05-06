@@ -1,0 +1,67 @@
+# EPA project configuration.
+# All paths are relative to repo root unless absolute.
+
+paths:
+  raw_dir: data/raw
+  processed_dir: data/processed
+  examples_csv: data/processed/examples.csv
+  model_path: models/epa_model.joblib
+  reports_dir: reports
+
+# Dataset acquisition. Reference distribution:
+#   https://github.com/RevRameshkumar/EPADataset
+#
+# The downloader tries `url` first, then `git clone` of `git_repo`,
+# then a synthetic fallback so the pipeline remains runnable end-to-end
+# in environments without network access.
+dataset:
+  url: null
+  git_repo: https://github.com/RevRameshkumar/EPADataset.git
+  data_filename: EPADataset.tsv
+  # How to aggregate annotator votes:
+  #   perfect  – keep only HITs where all judges agreed exactly (paper's strict
+  #              "perfect agreement" subset; loses ~28% of HITs but is cleanest)
+  #   majority – per-recipient majority vote across judges (recommended default)
+  #   any      – any judge that marked the recipient counts (max recall)
+  consensus: majority
+
+features:
+  # TF-IDF over (subject + task + body) text.
+  tfidf:
+    ngram_range: [1, 2]
+    min_df: 2
+    max_df: 0.95
+    max_features: 50000
+    sublinear_tf: true
+    lowercase: true
+  # Optional character n-gram features (off by default for memory).
+  char_tfidf:
+    enabled: false
+    ngram_range: [3, 5]
+    min_df: 2
+    max_features: 30000
+
+split:
+  # Group-aware split: candidates from the same email/task never appear in
+  # both train and test.
+  group_key: email_task_id
+  test_size: 0.2
+  val_size: 0.1
+  random_state: 42
+
+model:
+  # Logistic regression hyperparameters.
+  C: 1.0
+  class_weight: balanced       # set to null to disable
+  max_iter: 1000
+  solver: liblinear
+  random_state: 42
+
+evaluation:
+  default_threshold: 0.5
+  # Thresholds to sweep when choosing precision/recall trade-offs.
+  threshold_grid: [0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8]
+
+service:
+  # Default decision threshold used by the FastAPI /predict endpoint.
+  default_threshold: 0.5

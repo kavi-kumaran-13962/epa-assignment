@@ -1,0 +1,11 @@
+{
+  "sender": {"name": "Caira Wong", "email": "caira@example.com"},
+  "to": [
+    {"name": "Anna Smith", "email": "anna@example.com"},
+    {"name": "Brad Jones", "email": "brad@example.com"}
+  ],
+  "cc": [{"name": "John Patel", "email": "john@example.com"}],
+  "subject": "Draft report",
+  "body": "Hi Anna, can you and Brad complete a draft by Friday?",
+  "task": "can you and Brad complete a draft by Friday?"
+}
