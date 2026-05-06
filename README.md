@@ -51,7 +51,7 @@ the trivial every-recipient baseline.
 
 ---
 
-## 2. Why this problem is interesting
+## 2. What makes this problem hard
 
 Several things make EPA harder than it sounds.
 
@@ -176,7 +176,7 @@ consistency.
 
 ---
 
-## 5. What differentiates this submission
+## 5. Design highlights
 
 ### Problem-aware feature engineering
 Not generic TF-IDF. Five feature families designed against the EPA task
@@ -401,7 +401,7 @@ of finding that reframes the next iteration of work.
 
 ---
 
-## 10. If I had more time
+## 10. Future improvements
 
 In rough priority order:
 
@@ -431,7 +431,7 @@ In rough priority order:
 
 ---
 
-## 11. Reviewer-facing design decisions
+## 11. Design Q&A
 
 **Q. Why binary classification rather than ranking?**
 Binary matches the paper, gives apples-to-apples comparisons, and
