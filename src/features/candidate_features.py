@@ -108,6 +108,16 @@ def _feature_names() -> CandidateFeatureNames:
             "task_length_tokens",
             "body_length_tokens",
             "subject_length_tokens",
+            # First-person commitment signals: when the task itself is the
+            # sender committing themselves ("I'll handle this", "let me look
+            # into it") the sender is often the responsible party. These
+            # features were added to address the dominant FN cluster
+            # identified in error analysis (sender first-person commitments).
+            "task_first_person_subject",
+            "task_first_person_future",
+            "task_let_me",
+            "task_first_person_object",
+            "task_first_person_and_sender",
         ],
         counts=[
             "num_to_recipients",
@@ -185,9 +195,18 @@ def _compute_row_features(row: pd.Series) -> Dict[str, float]:
     num_total = int(row.get("num_total_candidates", 0) or 0)
 
     multi_role = int(sum([is_sender, is_to, is_cc]) > 1)
-    only_recipient = int(num_total - is_sender == 1 and is_sender == 0)
-    if num_total == 1:
+    # A candidate is the "only recipient" when the email has exactly one
+    # non-sender candidate. The two cases:
+    #   - sender + 1 recipient: num_total == 2, candidate is_sender == 0;
+    #   - no sender (rare):     num_total == 1.
+    # Earlier versions of this feature mishandled the standard 2-candidate
+    # case; see tests/test_features.py for the regression test.
+    if num_total == 2 and is_sender == 0:
         only_recipient = 1
+    elif num_total == 1 and is_sender == 0:
+        only_recipient = 1
+    else:
+        only_recipient = 0
     candidate_email_missing = int(not cand_email)
     candidate_name_missing = int(not cand_name)
     sender_same_domain = int(
@@ -218,6 +237,43 @@ def _compute_row_features(row: pd.Series) -> Dict[str, float]:
         "email_in_subject": _bi(cand_email and _phrase_in(subject, cand_email)),
     }
 
+    # First-person commitment cues. We look for the sender promising to do
+    # something themselves; combined with `is_sender` this gives the model
+    # a way to flip its strong sender-is-not-responsible prior in exactly
+    # the cases where it should.
+    first_person_subject = bool(
+        _word_in(task, "i")
+        or _phrase_in(task, "i'll")
+        or _phrase_in(task, "i will")
+        or _phrase_in(task, "i can")
+        or _phrase_in(task, "i'd")
+        or _phrase_in(task, "i would")
+        or _phrase_in(task, "i'm")
+    )
+    first_person_future = bool(
+        _phrase_in(task, "i'll")
+        or _phrase_in(task, "i will")
+        or _phrase_in(task, "i can")
+        or _phrase_in(task, "i would")
+        or _phrase_in(task, "i'd")
+        or _phrase_in(task, "i shall")
+        or _phrase_in(task, "i'll handle")
+        or _phrase_in(task, "i'll take")
+        or _phrase_in(task, "i'll do")
+        or _phrase_in(task, "i'll send")
+        or _phrase_in(task, "i'll get")
+    )
+    let_me = bool(
+        _phrase_in(task, "let me")
+        or _phrase_in(task, "allow me")
+    )
+    first_person_object = bool(
+        _word_in(task, "me")
+        or _word_in(task, "myself")
+        or _phrase_in(task, "to me")
+        or _phrase_in(task, "for me")
+    )
+
     # Pragmatics features.
     pragmatics = {
         "task_contains_you": int(_word_in(task, "you")),
@@ -240,6 +296,17 @@ def _compute_row_features(row: pd.Series) -> Dict[str, float]:
         "task_length_tokens": float(len(tokenize_basic(task))),
         "body_length_tokens": float(len(tokenize_basic(body))),
         "subject_length_tokens": float(len(tokenize_basic(subject))),
+        "task_first_person_subject": int(first_person_subject),
+        "task_first_person_future": int(first_person_future),
+        "task_let_me": int(let_me),
+        "task_first_person_object": int(first_person_object),
+        # Cross-feature: this is the actual lever — first-person commitment
+        # AND this candidate is the sender. The linear model's coefficient
+        # on this term should be strongly positive.
+        "task_first_person_and_sender": int(
+            (first_person_future or let_me or first_person_subject)
+            and is_sender == 1
+        ),
     }
 
     # Proximity features. We take the most informative of (full name, first

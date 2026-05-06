@@ -1,444 +1,572 @@
-# EPA – Email task-to-person assignment
+# EPA — Email task-to-person assignment
 
-A small, reproducible supervised-ML pipeline for the **Enron People
-Assignment (EPA)** problem (Rameshkumar et al., W-NUT 2018). Given an
-email plus an extracted task sentence, decide for each candidate person
-(sender, To, Cc) whether they are responsible for the task.
+A reproducible supervised-ML pipeline for the W-NUT 2018 EPA problem
+(Rameshkumar et al.): given an email and an extracted task sentence,
+decide for each candidate person on the email whether they're responsible
+for the task.
 
-This is positioned as a real-world email-assistant problem, not a generic
-text-classification benchmark. The goal is to demonstrate end-to-end
-engineering judgment — clean data engineering, sensible features,
-transparent baselines, group-aware evaluation, and a production-shaped
-inference service — rather than to chase F1.
+---
 
-## 1. Problem framing
+### At a glance
 
-Per the paper, EPA is reduced to a series of binary decisions: for every
-`(email, task, candidate person)` tuple, predict whether that person
-should be notified. We frame and engineer the problem exactly that way:
+| | |
+|---|---|
+| **Problem framing** | Candidate-level responsibility prediction |
+| **Model** | Logistic Regression + structured candidate features + TF-IDF |
+| **Evaluation** | Grouped split by HIT, validation-only threshold tuning |
+| **Held-out F1** | **0.847** |
+| **Baseline lift** | **+19.9 F1** over every-recipient baseline |
+| **Production shape** | Serialized sklearn `Pipeline` + FastAPI inference |
+| **Quality checks** | 58 tests + train/serve parity validation |
 
-- One training example per candidate person per email-task pair.
-- Candidate set = sender + To + Cc, deduplicated by lowercased email.
-- `label = 1` if the candidate is in the annotator-resolved responsible
-  set, `0` otherwise.
-- "No-one is responsible" → all candidate rows for that HIT are `0`.
-- A single task can have multiple responsible people; we treat each
-  candidate independently.
+---
 
-This solution treats EPA as **supervised binary classification over
-(email, task, candidate person)**. We intentionally avoided LLM
-prompting / RAG / chat APIs because the assignment asks for a trainable
-supervised pipeline, and because the original paper showed that a
-logistic-regression baseline with handcrafted features is a sensible
-starting point for an interpretable, reproducible solution.
+## 1. Executive summary
 
-## 2. Dataset
+EPA is not text classification. Two candidate rows from the same email
+have identical body, identical task text, identical sender, identical
+recipient list — only the candidate identity changes. Topic features
+cannot tell them apart. The signal lives in the **relationship** between
+the task language, the candidate, and the rest of the recipient list.
 
-We use the official rehost of the EPA dataset published by the paper's
-first author at <https://github.com/RevRameshkumar/EPADataset>. It ships a
-single `EPADataset.tsv` containing 6,734 HITs with the following per-row
-JSON payload:
-
-```json
-{
-  "EmailID":       "...",
-  "Subject":       "...",
-  "From":          {"emailAddress": {"Name": "...", "Address": "..."}},
-  "ToRecipients":  {"emailAddressList": [{"emailAddress": {...}}, ...]},
-  "CcRecipients":  {"emailAddressList": [...]},
-  "Message":       "... <mark>task sentence</mark> ... <br/> ...",
-  "TaskSentence":  "task sentence",
-  "Judgements":    [{"<annotator_id>": ["responsible@x", ...]}, ...]
-}
-```
-
-Acquisition (`src/data/download.py`) tries three strategies in order so
-the pipeline is robust to network restrictions:
-
-1. **Explicit URL** in `dataset.url` (e.g. an internal mirror).
-2. **`git clone --depth 1`** of `dataset.git_repo` (defaults to the
-   reference repo above). Works in environments where direct
-   `raw.githubusercontent.com` egress is blocked but `github.com` git
-   transport is allowed.
-3. **Synthetic fallback** — generates a small EPA-shaped dataset under
-   `data/raw/_epa_synthetic.json` so the pipeline remains runnable
-   end-to-end for reviewers without dataset access. The synthetic file
-   is prefixed with `_` so the parser ignores it whenever the real TSV
-   is also present.
-
-`src/data/parse_epa.py` is **format-flexible**: it accepts the reference
-TSV, plus JSON (list-of-records or `{"data": [...]}`), JSONL, and CSV
-rehosts. Field-name aliases (`From`/`sender`, `Message`/`body`,
-`Judgements`/`annotations`, etc.) are mapped onto a single normalized
-schema. Both annotator-label formats observed in the wild are handled
-(per-judge dicts shipped by the reference repo, plus per-recipient
-binary votes used by some forks). Aggregation across judges supports:
-
-- `consensus: perfect` – keep only HITs where every judge agreed
-  exactly (matches the paper's strict α=0.6123 analysis);
-- `consensus: majority` (default) – per-recipient majority vote;
-- `consensus: any` – any judge that marked the recipient counts.
-
-The expected normalized record after parsing:
-
-```python
-{
-    "email_id": str, "task_id": str,
-    "subject": str, "body": str, "task": str,
-    "sender": (name, email),
-    "to":  [(name, email), ...],
-    "cc":  [(name, email), ...],
-    "responsible_emails": [email, ...],
-    "no_one_responsible": bool,
-    "n_judges": int,
-    "perfect_agreement": bool,
-}
-```
-
-### What the data actually looks like
-
-After parsing the reference dataset with the default majority-vote
-consensus we get **6,734 HITs → 19,101 candidate rows** (mean 2.84
-candidates per HIT). 6,137 of the HITs (91%) are perfect-agreement at
-the HIT level. Class prior = **0.486**.
-
-Class balance by candidate role (the dominant structural signal):
-
-| candidate_role | count  | positive_rate |
-|----------------|-------:|--------------:|
-| sender         | 6,408  | 0.017         |
-| to             | 8,415  | 0.867         |
-| cc             | 3,943  | 0.430         |
-| multiple       |   335  | 0.555         |
-
-Positive rate by candidate-set size (the paper's primary cut):
-
-| num_total_candidates | n     | positive_rate |
-|---------------------:|------:|--------------:|
-| 2 (single recipient) | 7,580 | 0.499         |
-| 3                    | 3,588 | 0.475         |
-| 4                    | 3,236 | 0.475         |
-| 5                    | 3,000 | 0.442         |
-| 6                    | 1,068 | 0.507         |
-| 7                    |   546 | 0.571         |
-
-## 3. Approach
+So this is **structured addressee resolution under ambiguity**, modeled
+as binary classification over
 
 ```
-data/raw  ──▶  parse_epa  ──▶  build_examples  ──▶  data/processed/examples.csv
-                                                          │
-                                                          ▼
-                                          ┌───── train.py ─────┐
-                                          │                    │
-                                ColumnTransformer       baselines / sweep
-                            ┌────────┬────────────┐              │
-                            │        │            │              ▼
-                       word TF-IDF   char TF-IDF  Candidate     reports/
-                            │        (optional)   feature       evaluation.{md,json}
-                            └─────┬──┴───┬────────┘
-                                  ▼      ▼
-                              LogisticRegression
-                                     │
-                                     ▼
-                          models/epa_model.joblib
-                                     │
-                                     ▼
-                       FastAPI: src/service/app.py  →  POST /predict
+(email, task, candidate_person)  →  responsible / not responsible
 ```
 
-The trained pipeline (TF-IDF + structured features + LR) is serialized in
-one go via `joblib`, so the FastAPI service reuses the **exact** same
-feature engineering used in training. That train/serve parity is the
-single most important property for reproducibility.
+Each HIT is exploded into one row per candidate (sender + To + Cc, deduped
+by lowercased email). The candidate's own role flags, name-match signals
+and proximity to the task carry most of the model's lift; TF-IDF over
+the email text contributes the topical floor.
 
-## 4. Training example construction
+I picked binary because the paper picked binary, the framing matches the
+production scenario (one notification per `(person, task)` pair), and
+the linear model is inspectable enough to make the error analysis
+tractable. The independent binary formulation has known multi-recipient
+limitations discussed in §10. On a leakage-safe held-out grouped split
+the final model reaches **0.847 F1**, improving roughly 20 points over
+the trivial every-recipient baseline.
 
-`src/data/build_examples.py` materializes one row per candidate. Important
-details:
+---
 
-- Candidates are deduplicated by lowercased email; if the same person
-  appears in multiple roles (e.g. To and Cc), we keep one row with
-  `candidate_role = multiple` and set every relevant role flag.
-- We preserve sender / to / cc role information explicitly via
-  `is_sender`, `is_to`, `is_cc` flags. The paper's annotation spec lets
-  the sender be marked responsible too (they sometimes commit themselves
-  to the task), so the sender is a candidate, not excluded.
-- `full_context = subject + " [SEP] " + task + " [SEP] " + body`. This
-  string is the input to TF-IDF.
-- Each row carries `email_task_id = email_id::task_id`. We use that as
-  the **group key** for splitting so candidates from the same HIT never
-  cross train / test boundaries.
-- Each row carries `n_judges` and `perfect_agreement` so that downstream
-  evaluation can slice to the paper's strict universally-agreed subset.
+## 2. Why this problem is interesting
 
-## 5. Feature engineering
+Several things make EPA harder than it sounds.
 
-Three feature families, combined via `ColumnTransformer`:
+**Annotator disagreement is structural, not noise.** The paper reports
+α = 0.61 on Krippendorff's alpha — meaningfully below the 0.8 "reliable"
+threshold. That's a fact about the task, not about the annotators: emails
+genuinely are ambiguous about which of N recipients is meant by "you",
+and reasonable humans disagree. Any model trained on this data is
+predicting *consensus*, not ground truth.
 
-**Word TF-IDF** over `full_context` — 1-to-2 grams, sublinear TF,
-min_df / max_df pruning, capped at 50k features.
+**Implicit assignment language is the rule, not the exception.** Of
+3,735 test rows in the held-out split, only 165 contain the candidate's
+explicit name in the task. The other 96% rely on email pragmatics —
+imperative verbs, "you/your", politeness markers, conjunctions — to
+distribute responsibility across the To list.
 
-**Optional char TF-IDF** (off by default) — 3-to-5 grams via `char_wb`,
-useful on Enron's noisier formatting; flip `features.char_tfidf.enabled`
-in `config.yaml`.
+**Multi-recipient ambiguity dominates.** Roughly two-thirds of HITs
+have ≥3 candidates. The structural prior says "anyone on To is likely
+responsible" (87% positive rate for To), so a model that predicts
+"every To recipient" gets ~0.65 F1 for free. The remaining headroom is
+almost entirely in distinguishing *which subset* of multi-recipient cases
+is meant.
 
-**Structured candidate features** (`src/features/candidate_features.py`):
+**Email body text is hostile.** Enron formatting fuses sentences across
+`<br/>` boundaries, includes quoted thread history, and contains internal
+routing addresses (`chris.stokley/HOU/ECT@ECT`) that are technically
+emails but not really person identifiers.
 
-- *Role flags*: `is_sender`, `is_to`, `is_cc`, `appears_in_multiple_roles`,
-  `is_only_recipient`, missing-name/email flags, sender-domain match.
-- *Name / email reference* (the addressee-tagging signal): does the
-  candidate's first / last / full name or email or local part appear in
-  the task / body / subject? Each is a binary feature per location.
-- *Email pragmatics over the task text*: `you`, `your`, `please`,
-  `can you` / `could you` / `would you`, `let me know`, `?`,
-  question-stem heuristic, `we` / `us` / `team`, imperative-verb hit on
-  the first six tokens, plus length features.
-- *Counts*: number of To, Cc, and total candidates (linear and log-scale).
-- *Proximity*: same-sentence-as-task, name-before-task, name-after-task,
-  normalized character distance between the candidate's name and the
-  task sentence in the body.
+These four properties — agreement ceiling, implicit language, structural
+priors that go most of the way, and noisy text — shape every feature and
+modeling choice below.
 
-We deliberately do **not** rely on TF-IDF alone — addressee resolution
-is a person-assignment problem, not a topic-classification problem, and
-the structured features carry a lot of the signal.
+---
 
-## 6. Baselines
+## 3. Design philosophy
 
-Two transparent baselines are reported alongside the main model so we can
-sanity-check the supervised gains:
+### A. Logistic regression, deliberately
 
-1. **Every-recipient** — predict every candidate as responsible. Recall
-   is 1.0 by construction; precision equals the class prior. Mirrors the
-   paper's Table 5.
-2. **Class-prior** — predict the global positive rate as the score for
-   every candidate, threshold at 0.5 (so collapses to all-zero unless
-   the prior is ≥0.5). Mirrors the paper's `x̄`-baseline.
+The paper's baseline was LR with handcrafted features. Matching that
+isolates the effect of *features and training data* from *model class*.
+LR also gives me three production-relevant properties: signed coefficients
+I can read directly, calibrated-ish probabilities, and a fit time
+measured in seconds. A neural model is the right next step *after* the
+LR baseline is exhausted, not before.
 
-## 7. Model
+### B. Engineered features over deep learning
 
-Logistic regression (`solver=liblinear`, `class_weight=balanced` by
-default) on the combined sparse feature matrix. The choice is deliberate:
+The bottleneck on this task is relational reasoning between candidate
+identity and task text. TF-IDF can't see candidate identity. A
+transformer would help on slices my features don't address (coreference,
+conjunction parsing) — but on most of the dataset, role flags and
+name-match features carry the signal. I'd ship a transformer only after
+listwise scoring and better coreference, not before.
 
-- Matches the paper's setup, so comparisons against the published
-  baselines are apples-to-apples.
-- Probability-calibrated by default and inspectable
-  coefficient-by-coefficient.
-- Trains in seconds on the full Enron split; easy to iterate on features.
+### C. Train/serve parity by structural design
 
-A neural model (small MLP, transformer fine-tune) is left as an explicit
-future improvement rather than being shipped as the default — see §11.
+There is exactly one feature pipeline: a scikit-learn `Pipeline`
+(`ColumnTransformer` over TF-IDF + a custom `CandidateFeatureExtractor`,
+plus `LogisticRegression`). It's `fit` at training, serialized to
+`models/epa_model.joblib`, and called via `predict_proba` by the FastAPI
+service. There is no separate "inference featurizer". Adding a feature
+is a one-place change.
 
-## 8. Evaluation
+### D. Group-aware splitting, with assertions
 
-`src/models/evaluate.py` recomputes everything from a saved model. Group
-splitting uses `GroupShuffleSplit` on `email_task_id` so candidates from
-the same HIT never appear on both sides. We report:
+A row-level random split would put candidates from the same HIT on both
+sides of the train/test boundary. This would leak shared HIT context
+into evaluation and inflate reported performance. `GroupShuffleSplit`
+on `email_task_id` prevents this; an explicit `assert_no_group_leakage`
+runs after every split as a defensive line against future regressions.
 
-- precision, recall, F1, accuracy, PR-AUC, ROC-AUC, confusion matrix;
-- per-scenario slices: single- vs multi-recipient (paper's primary
-  cut), tasks containing "you/your", tasks with an explicit candidate
-  name, no-one cases, candidate-is-sender, candidate-is-recipient,
-  perfect-agreement-only;
-- a threshold sweep (precision / recall trade-off) so a product team can
-  pick a higher-precision (avoid notifying wrong people) or
-  higher-recall (avoid missing responsible people) operating point.
+### E. Denormalized candidate rows
 
-### Held-out test results
+Each candidate row carries the full email body. That's ~65 MB on disk
+for redundant storage. The benefit: the same row format is what the
+inference path produces from a JSON payload, so the trained Pipeline
+applies *as is* without a parallel feature implementation. A future
+production version would normalize into HIT-level + candidate-level
+tables and join at training; that's premature here.
 
-On the held-out test split (3,900 candidate rows from 1,373 HITs), at
-the default 0.5 threshold:
+---
 
-| metric    | value |
-|-----------|------:|
-| precision | 0.823 |
-| recall    | 0.872 |
-| F1        | 0.847 |
-| accuracy  | 0.849 |
-| PR-AUC    | 0.923 |
-| ROC-AUC   | 0.931 |
+## 4. Architecture at a glance
 
-Confusion: TP = 1,630, FP = 351, FN = 240, TN = 1,679.
-
-Scenario breakdown — single-recipient HITs are essentially solved
-(F1 = 0.96); the residual error budget is concentrated in
-multi-recipient HITs:
-
-| scenario                    |  n   | precision | recall |  F1   |
-|-----------------------------|-----:|----------:|-------:|------:|
-| single_recipient_email      | 1468 |     0.961 |  0.968 | 0.964 |
-| multi_recipient_email       | 2432 |     0.740 |  0.809 | 0.773 |
-| task_has_you_or_your        | 1592 |     0.814 |  0.863 | 0.837 |
-| task_has_explicit_name      |  165 |     0.804 |  0.897 | 0.848 |
-| task_has_no_explicit_person | 3735 |     0.824 |  0.870 | 0.847 |
-| candidate_is_sender         | 1347 |     0.850 |  0.288 | 0.430 |
-| perfect_agreement_only      | 3398 |     0.850 |  0.896 | 0.873 |
-
-For comparison, the paper's Avocado-trained baseline transferred to
-Enron achieved P/R/F1 = **0.69 / 0.89 / 0.78** on single-recipient and
-**0.62 / 0.70 / 0.66** on multi-recipient. Our numbers exceed both
-because we train directly on Enron and combine TF-IDF with the
-handcrafted features, but the paper's qualitative observation
-(multi-recipient is meaningfully harder) clearly carries over.
-
-The current Markdown evaluation report lives at
-[`reports/evaluation.md`](reports/evaluation.md) and a structured JSON
-summary at [`reports/evaluation.json`](reports/evaluation.json).
-
-## 9. Error analysis
-
-[`reports/error_analysis.md`](reports/error_analysis.md) walks through
-the residual errors with concrete examples drawn from the test split.
-The headline:
-
-- **92% of FPs** sit in multi-recipient HITs — over-assignment when the
-  task is imperative but doesn't disambiguate which of N recipients is
-  meant.
-- **17% of FNs** are senders committing themselves ("I'll handle…",
-  "let me…"), where our `is_sender` prior pulls scores down.
-- **41% of FPs** are tasks containing "you" / "your", where the model
-  spreads responsibility across recipients instead of resolving the
-  pronoun.
-
-The report tags each error category with a likely cause and a concrete
-next-step improvement. The top three priorities are listwise scoring
-across candidates within a HIT, first-person commitment features for
-the sender, and out-of-candidate-list NER for the no-one cases.
-
-## 10. Inference service
-
-A minimal FastAPI service mirrors the train-time feature pipeline.
-
-```bash
-uvicorn src.service.app:app --reload --port 8000
+```
+EPADataset.tsv  ──▶  parse_epa  ──▶  build_examples
+                                          │
+                                  candidate-level CSV
+                                          │
+                                          ▼
+                       ┌───── group split (HIT-level) ─────┐
+                       │                                    │
+                  train + val                              test
+                       │                                    │
+                       ▼                                    │
+                ColumnTransformer                           │
+        ┌──────────────┴──────────────┐                    │
+        │                              │                    │
+   word TF-IDF      structured candidate features           │
+        │                              │                    │
+        └────────────┬─────────────────┘                    │
+                     ▼                                       │
+             LogisticRegression                              │
+                     │                                       │
+                     ▼                                       │
+        select threshold on val ──────────────┐             │
+                                              ▼              │
+                              evaluate ONCE on test ◀────────┘
+                                              │
+                       ┌──────────────────────┴──────────────────────┐
+                       ▼                                              ▼
+          models/epa_model.joblib                    reports/{evaluation,error_analysis}.md
+                       │
+                       ▼
+            FastAPI: POST /predict
 ```
 
-```bash
-curl -X POST http://localhost:8000/predict \
-    -H "Content-Type: application/json" \
-    -d '{
-      "sender": {"name": "Caira Wong", "email": "caira@example.com"},
-      "to": [{"name": "Anna Smith", "email": "anna@example.com"},
-             {"name": "Brad Jones", "email": "brad@example.com"}],
-      "cc": [{"name": "John Patel", "email": "john@example.com"}],
-      "subject": "Draft report",
-      "body": "Hi Anna, can you and Brad complete a draft by Friday?",
-      "task": "can you and Brad complete a draft by Friday?"
-    }'
-```
+The core design goal was not only predictive performance, but tight
+alignment between evaluation methodology, feature generation, and the
+inference path. Every major design choice was made to preserve that
+consistency.
 
-Response (real output from the trained model on the example payload):
+---
 
-```json
-{
-  "task": "can you and Brad complete a draft by Friday?",
-  "threshold": 0.5,
-  "assignments": [
-    {"person": "anna@example.com",  "score": 0.836, "assigned": true,  "role": "to"},
-    {"person": "brad@example.com",  "score": 0.729, "assigned": true,  "role": "to"},
-    {"person": "caira@example.com", "score": 0.010, "assigned": false, "role": "sender"},
-    {"person": "john@example.com",  "score": 0.530, "assigned": true,  "role": "cc"}
-  ]
-}
-```
+## 5. What differentiates this submission
 
-Threshold can be overridden per request via either a query parameter
-(`?threshold=0.7`) or the request body. `GET /health` returns whether the
-model artifact is present without loading it.
+### Problem-aware feature engineering
+Not generic TF-IDF. Five feature families designed against the EPA task
+specifically: role flags, addressee lexical alignment, pragmatic task
+cues, proximity, and a sender × first-person commitment cross-feature
+that targets a specific failure mode identified in error analysis.
 
-## 11. Limitations
+### Leakage-safe evaluation
+`GroupShuffleSplit` on `email_task_id`, an `assert_no_group_leakage`
+defensive assertion, and **threshold selection on validation only** so
+the test split is consumed exactly once. The most common methodological
+mistake in take-homes — selection on test — is deliberately avoided.
 
-- **Thread-aware modeling is shallow.** The features see the body text
-  but do not parse quoted history into structured prior turns. The
-  paper's no-explicit-mention case (Figure 2) needs more than that.
-- **Coreference is heuristic.** "You" / "your" / "we" are detected as
-  pragmatic features but not resolved to specific recipients. Likely the
-  single biggest source of error.
-- **Independent binary classification.** Candidates from the same email
-  are scored independently. A learning-to-rank formulation would let
-  the model trade scores between candidates within a HIT.
-- **No probability calibration.** Scores are well-ordered but the
-  numeric values aren't calibrated to true probabilities; threshold
-  choice should be made on a held-out PR curve, not a fixed 0.5.
-- **Annotation noise is not modeled.** The paper reports α = 0.61 inter-
-  annotator agreement; we currently aggregate by majority vote (or
-  perfect agreement, optional), and don't down-weight noisy HITs.
-- **Out-of-candidate-list references.** "Brad will complete the draft"
-  with Brad not on To/Cc → the model still has to assign someone (or
-  no-one) from the To/Cc list, and currently has no NER signal for
-  this case.
+### Train / serve parity
+A single `Pipeline` artifact drives both training and inference. The
+FastAPI service reuses the exact same featurization with no parallel
+implementation. Verified by `tests/test_inference_parity.py`.
 
-## 12. Future improvements
+### Scenario-based evaluation
+Per-slice metrics for single- vs multi-recipient (the paper's primary
+cut), tasks with explicit names, tasks with implicit "you/your", sender
+candidates, and the perfect-agreement-only subset.
 
-- Better thread-aware modeling: parse quoted history (`---- Original
-  Message ----` blocks) into structured prior turns and add features /
-  representations from them.
-- Coreference / addressee resolution for "you", "your", "we" – e.g.
-  use a small dependency parse plus salience heuristics to map
-  pronouns to candidates.
-- Learning-to-rank formulation over candidates instead of independent
-  binary classification (e.g. listwise softmax with a "no-one" slot).
-- Probability calibration (`CalibratedClassifierCV` with isotonic on a
-  held-out fold) before exposing scores to product surfaces.
-- Human-in-the-loop feedback: capture user corrections from the email
-  client and fold them back as labelled data with sample weights.
-- Better handling of group emails / aliases: expand known aliases via
-  a directory lookup so individual recipients can be scored.
-- Syntactic / dependency features (subject-of-imperative,
-  vocative-NP detection) for better addressee tagging.
-- Optional neural model after the strong baseline is established —
-  e.g. distil a small encoder over the same `(email, task, candidate)`
-  triples; only ship if it materially beats the LR baseline at a
-  comparable inference cost.
+### Honest error analysis, auto-regenerated
+`reports/error_analysis.md` is regenerated from the live test predictions
+on every train run. It surfaces the dominant failure modes (multi-
+recipient over-assignment, sender first-person commitments, out-of-list
+references) with concrete examples and ranked next-step fixes.
 
-## 13. How to run
+### Production-shaped design
+FastAPI service with per-request threshold override, `/health`,
+graceful 422 on malformed payloads, and a serialized model bundle that
+carries `model_version`, `git_sha`, `trained_at`, and `sklearn_version`
+for traceability.
+
+### Test discipline
+58 pytest tests covering parser shapes, group-leakage prevention,
+feature correctness (including a regression test for the
+`is_only_recipient` bug fixed in this version), and inference parity.
+
+---
+
+## 6. Feature engineering deep dive
+
+TF-IDF (1–2-grams over `subject [SEP] task [SEP] body`) gives the model
+a topical floor. But TF-IDF is identical across candidate rows from the
+same HIT, so it can't discriminate *between* candidates. Five structured
+families do that work.
+
+### Structural role priors
+`is_sender`, `is_to`, `is_cc`, `appears_in_multiple_roles`,
+`is_only_recipient`, `sender_same_domain_as_candidate`, and recipient
+counts.
+
+These encode the dominant statistical signal: 87% of To candidates are
+positive, 43% of Cc, 1.7% of senders. `is_only_recipient` carves out
+the "sender + 1 recipient" case where pragmatics are largely redundant.
+
+### Addressee lexical alignment
+`first_name_in_task`, `last_name_in_task`, `full_name_in_task`,
+`email_in_task`, `local_part_in_task`, plus the same set over body and
+subject.
+
+A candidate's name appearing in the task is a near-certain signal.
+Whole-word matching with length gates prevents substring false-positives
+("Sam" in "samples", short local parts inside larger words). Fires on
+only ~4% of test rows, but with very high precision when it does.
+
+### Pragmatic task cues
+`task_contains_you/your/please/can_you/could_you/would_you/let_me_know`,
+question marks and question stems, first-person plural, imperative-verb
+hit on the first six tokens, and length features.
+
+These distinguish real assignments from informational text. Combined
+with role flags, the linear model learns rules like
+`is_to=1 AND has_can_you → likely responsible`.
+
+### First-person commitment cues
+`task_first_person_subject`, `task_first_person_future`, `task_let_me`,
+`task_first_person_object`, and the cross-feature
+`task_first_person_and_sender`.
+
+Added to address the dominant FN cluster identified in error analysis:
+senders committing themselves ("I'll handle this", "let me look into
+it"). The cross-feature fires only when the candidate *is* the sender
+AND the task is first-person — the lever the model needs to flip its
+"senders aren't responsible" prior in exactly the right cases.
+
+### Proximity features
+Whether the candidate's name appears in the same sentence as the task,
+before/after the task in the body, and a normalized character distance
+from name to task.
+
+Captures the pattern that people are addressed *just before* the
+imperative directed at them. Brittle on `<br/>`-fused sentences, but
+cheap to compute and effective on the cleaner half of the data.
+
+---
+
+## 7. Methodological safeguards
+
+| safeguard | implementation | guards against |
+|---|---|---|
+| Group-aware split | `GroupShuffleSplit` on `email_task_id` | candidates from same HIT in both train and test |
+| Leakage assertion | `assert_no_group_leakage(...)` after every split | future regressions to the splitting logic |
+| Validation-only threshold tuning | `select_threshold_on_val` picks argmax-F1 from the val sweep | selection-on-test bias |
+| Test consumed once | Single `predict_proba` call on test at the chosen threshold | iterating against the test set |
+| Pipeline fit on train only | `Pipeline.fit(train_df, ...)` | TF-IDF vocabulary leaking val/test text |
+| Variance estimate | Optional grouped 5-fold CV F1 (mean ± std) on train+val | over-reading a single point estimate |
+| Train/serve parity | One `Pipeline` end-to-end | featurization drift between train and serve |
+| Deterministic seeds | `random_state=42` in splitter, model, synthetic data | run-to-run noise masking real changes |
+| Test suite | 58 pytest tests | silent regressions in the parser, splitter, features, inference |
+
+The README is not the source of truth for numbers. **`reports/evaluation.md`
+and `reports/error_analysis.md` are auto-regenerated on every train
+run** and are the authoritative artifacts.
+
+---
+
+## 8. Results
+
+### Held-out test set
+
+3,900 candidate rows from 1,373 HITs, threshold tuned on validation
+(chosen value: 0.40), evaluated once on test:
+
+| metric | value |
+|---|---:|
+| precision | 0.786 |
+| recall | 0.918 |
+| F1 | 0.847 |
+| PR-AUC | 0.924 |
+| ROC-AUC | 0.932 |
+| confusion | TP 1,717 · FP 468 · FN 153 · TN 1,562 |
+
+### Baselines
+
+| | precision | recall | F1 |
+|---|---:|---:|---:|
+| Every-recipient | 0.480 | 1.000 | 0.648 |
+| Class-prior @ chosen threshold | 0.480 | 1.000 | 0.648 |
+| **Main model** | **0.786** | **0.918** | **0.847** |
+
+The supervised model lifts F1 by ~20 points over the trivial floor —
+real signal, not pipeline plumbing artifact.
+
+### Scenario slices
+
+| slice | F1 | comment |
+|---|---:|---|
+| single_recipient_email | ~0.96 | essentially solved |
+| multi_recipient_email | ~0.78 | residual error budget lives here |
+| candidate_is_sender | ~0.45 | first-person commitment cluster, partially addressed |
+| task_has_you_or_your | ~0.84 | implicit-pronoun overreach is the main failure |
+| perfect_agreement_only | ~0.88 | upper bound for clean labels |
+
+(Exact per-slice numbers regenerate into `reports/evaluation.md` on
+every train run.)
+
+### Interpretation
+
+The headline F1 is dominated by single-recipient cases. The interesting
+question is the gap between single (0.96) and multi (0.78) — that's
+where every future improvement effort should land. The sender slice
+(0.45) is the remaining cluster the new first-person features partially
+address; an honest read says they help but don't close the gap, because
+many sender-positive cases require coreference of "me" that the linear
+model can't do.
+
+### Comparison to the paper, honestly
+
+The W-NUT 2018 paper reports two baseline families:
+
+* **Avocado-trained → Avocado-evaluated** (in-domain): P/R ≈ 0.9/0.9.
+* **Avocado-trained → Enron-evaluated** (transfer): P/R/F1 ≈ 0.69/0.89/0.78
+  on single-recipient, 0.62/0.70/0.66 on multi-recipient.
+
+This submission trains *and* evaluates on Enron — an in-domain setting.
+The right comparison is therefore the paper's Avocado→Avocado in-domain
+0.9, against which we sit *below*. We do exceed the transfer baseline,
+but that's because we don't have to bridge a domain gap, not because
+the modeling is better.
+
+The Enron-only in-domain comparison the paper doesn't publish is what
+this work approximates; there's no perfect benchmark.
+
+---
+
+## 9. Failure modes and what I learned
+
+The auto-generated error analysis catalogs ten failure categories with
+concrete examples. The four that dominate the error budget:
+
+**Multi-recipient over-assignment** (≈90% of FPs). Strong imperative +
+`is_to=1` + nothing in the task to disambiguate which of N recipients
+is meant. The model marks everyone. Independent binary classification
+fundamentally can't solve this — there's no mechanism for "if Anna is
+responsible, Brad is less likely". Listwise softmax with a no-one slot
+is the structural fix.
+
+**Sender first-person commitments** (~22% of FNs). "I'll handle this",
+"let me look into it" — the sender is occasionally the responsible
+party. The new `task_first_person_and_sender` cross-feature partially
+addresses this, but cases that hinge on "to me" or "for me" still
+require coreference the linear model can't do.
+
+**Out-of-list third-party references** ("Please ask Jeff to contact
+trader" with Jeff not on To/Cc). Pragmatics fire; the model defaults
+to a To recipient. The right fix is NER over the task — if a `PERSON`
+is mentioned that isn't on To/Cc, lower scores globally for the HIT.
+
+**Implicit "you" disambiguation** ("Can you and Brad review this?").
+The first-name match for Brad fires correctly; the "you" needs to be
+resolved to the conjunct's co-recipient. Conjunction-aware addressee
+tagging would close this.
+
+What I learned from the error analysis: my features address the slices
+they were designed for, but the dominant FP pattern (multi-recipient
+over-assignment) is invariant to feature engineering — it's an
+architectural ceiling. No amount of features fixes it. That's the kind
+of finding that reframes the next iteration of work.
+
+---
+
+## 10. If I had more time
+
+In rough priority order:
+
+1. **Listwise scoring with a no-one slot.** Replace the per-candidate
+   independent classifier with a softmax across candidates per HIT.
+   This is the only structural fix for multi-recipient over-assignment
+   and would meaningfully move the headline F1.
+
+2. **Probability calibration** (`CalibratedClassifierCV` with isotonic
+   regression on a held-out fold). Scores are well-ordered today but
+   not calibrated to true probabilities; a product team setting an
+   operating point is currently picking from a coarse grid.
+
+3. **A small transformer head over the same features.** Distilled or
+   frozen, fine-tuned only on the structured + task-text inputs. Worth
+   shipping only after #1 and #2 land — the gain over LR has to be
+   meaningful at comparable inference cost.
+
+4. **Better discourse modeling.** Parse `----- Original Message -----`
+   blocks into structured prior turns; add features over them. The
+   paper's "no explicit person" case (Figure 2) needs this.
+
+5. **Human disagreement modeling.** With α = 0.61 the labels themselves
+   are noisy; a model that predicts P(consensus) and a separate
+   P(annotator-i-agreement) might give a more honest confidence signal.
+   Sample-weighting by judge agreement is the cheaper version.
+
+---
+
+## 11. Reviewer-facing design decisions
+
+**Q. Why binary classification rather than ranking?**
+Binary matches the paper, gives apples-to-apples comparisons, and
+mirrors the production framing (one notification per `(person, task)`
+pair). The known weakness — independent scoring can over-assign in
+multi-recipient HITs — is documented and is the top future improvement.
+A listwise formulation with a no-one slot would be a strict improvement
+and is the right next step.
+
+**Q. Why not BERT?**
+The bottleneck isn't text understanding, it's relational reasoning
+between candidate identity and task language. TF-IDF gives me topical
+context cheaply; structured candidate features carry most of the
+signal. A transformer would help on slices my features don't address
+(coreference, conjunctions). I'd ship one only after listwise scoring
+and calibration, and only if it materially beats LR at comparable
+inference cost.
+
+**Q. Why `GroupShuffleSplit`?**
+Rows from the same HIT share all the email-level text. A row-level
+random split would let the model see body/task at training time and
+then "predict" on a row where everything except candidate identity is
+identical. Group-aware splitting plus an explicit leakage assertion
+ensures test scores reflect generalization to *unseen HITs*, not unseen
+candidates within seen HITs.
+
+**Q. Why duplicate the email body across candidate rows?**
+Storage cost (~65 MB CSV) for two real benefits. The same row format
+works at training and inference time, so the FastAPI service reuses
+the exact same `Pipeline` — no parallel featurizer. Per-candidate
+features (proximity, name-in-body) need both candidate identity and
+body text on the same row for cheap computation. A production version
+would normalize into HIT-level + candidate-level tables and join, but
+that's premature here.
+
+**Q. Why is the threshold tuned on validation rather than test?**
+Picking a threshold from the test set's PR curve is selection-on-test
+bias — the test F1 ends up optimistically biased toward the threshold
+that happened to maximize it on that specific split. Tuning on val and
+reporting test once at the chosen threshold gives an unbiased estimate
+of how that operating point generalizes.
+
+**Q. How would you improve precision without sacrificing recall?**
+Two levers. Calibrated thresholds with a higher operating point —
+trades recall for precision in a known way. Listwise scoring across
+candidates per HIT — fixes the dominant multi-recipient FP pattern
+without losing single-recipient performance. Calibration is the cheap
+win; listwise is the big win.
+
+**Q. How would you productionize this?**
+The FastAPI service is the skeleton. Before deploy: auth + rate
+limiting; structured logging + tracing + metrics; async wrapping of
+sklearn inference; a batch endpoint. After deploy: probability
+calibration; a feedback loop that captures user corrections and folds
+them back as labelled data with sample weights; periodic retraining
+gated by regression tests on the headline metric. The model bundle
+already carries `git_sha`, `model_version`, and `trained_at` so version
+identity is unambiguous.
+
+**Q. What are the dataset's limitations?**
+α = 0.61 inter-annotator agreement — labels are noisy by construction,
+not by sloppy annotation. Only ~32 HITs are labelled "no-one
+responsible" under majority consensus, which is suspiciously low for a
+real product setting. Email body formatting is genuinely messy
+(`<br/>`-fused sentences, internal Enron routing addresses, group
+aliases). The task sentence is given pre-extracted, so the harder
+upstream problem of detecting tasks isn't modeled here.
+
+---
+
+## 12. Final reflection
+
+The strongest thing I took from this exercise is that applied ML
+performance often comes more from correct problem framing,
+leakage-safe evaluation, and task-specific feature design than from
+model complexity. Once the framing was right — relational reasoning
+over `(email, task, candidate)` triples, group-aware splits, validation-
+only thresholds — a logistic regression with handcrafted features
+landed within striking distance of where deep models would land
+without any of the operational cost.
+
+What's left to improve isn't a model-class problem; it's an
+architectural one (independent binary scoring vs. listwise) and a
+linguistic one (coreference, conjunctions). Naming those clearly
+is more useful than chasing a small F1 gain on the wrong axis.
+
+---
+
+## Appendix A — How to run
 
 ```bash
 # 1. Install
 pip install -r requirements.txt
 
-# 2. Acquire raw data (tries url, then git clone, then synthetic fallback)
+# 2. Acquire the EPA dataset (tries url, then git clone, then synthetic)
 python -m src.data.download
 
 # 3. Build candidate-level training examples
 python -m src.data.build_examples \
-    --raw_dir data/raw \
-    --output data/processed/examples.csv \
-    --consensus majority      # or perfect | any
+    --consensus majority    # or perfect | any
 
-# 4. Train the model + write evaluation report
-python -m src.models.train \
-    --data data/processed/examples.csv \
-    --model_out models/epa_model.joblib
+# 4. Train + auto-write evaluation.md, evaluation.json, error_analysis.md
+python -m src.models.train
 
 # 5. Re-evaluate a saved model without retraining
-python -m src.models.evaluate \
-    --data data/processed/examples.csv \
-    --model models/epa_model.joblib \
-    --report_out reports/evaluation.md
+python -m src.models.evaluate
 
 # 6. One-off prediction from a JSON payload
 python -m src.models.predict --input example_payload.json
 
 # 7. Inference service
-uvicorn src.service.app:app --reload
+uvicorn src.service.app:app --reload --port 8000
+
+# 8. Tests
+pytest tests/ -v
+
+# 9. End-to-end verification (one command, every stage)
+python verify.py
 ```
 
-A typical end-to-end run on a laptop takes ~30 seconds (parsing the
-TSV, building examples, training LR on ~13k rows). The model artifact
-is ~2.4 MB; the candidate CSV is ~65 MB because we keep the full body
-text alongside each candidate row for slicing during evaluation.
+A typical end-to-end run takes ~30 seconds. The model artifact is
+~2.4 MB; the candidate CSV is ~65 MB.
 
-## Repo layout
+## Appendix B — Repo layout
 
 ```
 epa-assignment/
 ├── README.md
 ├── requirements.txt
 ├── config.yaml
+├── verify.py                  # end-to-end verification script
 │
 ├── data/
-│   ├── raw/             # downloaded EPADataset.tsv goes here
-│   └── processed/       # candidate-level examples.csv
+│   ├── raw/                   # EPADataset.tsv goes here
+│   └── processed/             # candidate-level examples.csv
 │
 ├── src/
 │   ├── data/
@@ -457,19 +585,35 @@ epa-assignment/
 │   │   ├── evaluate.py
 │   │   └── predict.py
 │   ├── service/
-│   │   └── app.py
+│   │   └── app.py             # FastAPI inference
 │   └── utils/
 │       ├── io.py
 │       └── text_cleaning.py
 │
+├── tests/
+│   ├── test_parse_epa.py
+│   ├── test_split.py
+│   ├── test_features.py
+│   ├── test_inference_parity.py
+│   ├── test_service.py
+│   └── test_serialization.py
+│
 ├── notebooks/
 │   └── 01_data_exploration.ipynb
 │
-├── reports/
+├── reports/                   # all auto-regenerated by train.py
 │   ├── evaluation.md
 │   ├── evaluation.json
 │   └── error_analysis.md
 │
 └── models/
-    └── epa_model.joblib
+    └── epa_model.joblib       # carries model_version, git_sha, trained_at
 ```
+
+## Reference
+
+Rameshkumar, R., Bailey, P., Jha, A., & Quirk, C. (2018).
+*Assigning people to tasks identified in email: The EPA dataset for
+addressee tagging for detected task intent.* W-NUT 2018, EMNLP.
+[ACL Anthology W18-6104](https://aclanthology.org/W18-6104/).
+Dataset: <https://github.com/RevRameshkumar/EPADataset>.

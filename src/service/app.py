@@ -52,7 +52,9 @@ class PredictRequest(BaseModel):
     subject: str = ""
     body: str = ""
     task: str
-    threshold: Optional[float] = None
+    # Constrained to [0, 1] so an out-of-range threshold gets a 422
+    # at the schema layer rather than producing nonsense scores.
+    threshold: Optional[float] = Field(default=None, ge=0.0, le=1.0)
 
 
 class Assignment(BaseModel):
@@ -124,7 +126,10 @@ def health() -> Dict[str, Any]:
 def predict(
     request: PredictRequest = Body(...),
     threshold: Optional[float] = Query(
-        None, description="Override the decision threshold (0..1)"
+        None,
+        ge=0.0,
+        le=1.0,
+        description="Override the decision threshold (0..1).",
     ),
 ) -> PredictResponse:
     try:

@@ -254,11 +254,11 @@ def check_held_out_metrics() -> None:
     fn = int(((y_pred == 0) & (y_test == 1)).sum())
     tn = int(((y_pred == 0) & (y_test == 0)).sum())
 
-    ok(f"precision = {p:.4f}  (README: 0.823)")
-    ok(f"recall    = {r:.4f}  (README: 0.872)")
-    ok(f"F1        = {f:.4f}  (README: 0.847)")
-    ok(f"PR-AUC    = {pr_auc:.4f}  (README: 0.923)")
-    ok(f"ROC-AUC   = {roc_auc:.4f}  (README: 0.931)")
+    ok(f"precision = {p:.4f}  (README: ~0.79)")
+    ok(f"recall    = {r:.4f}  (README: ~0.92)")
+    ok(f"F1        = {f:.4f}  (README: ~0.85)")
+    ok(f"PR-AUC    = {pr_auc:.4f}  (README: ~0.92)")
+    ok(f"ROC-AUC   = {roc_auc:.4f}  (README: ~0.93)")
     info(f"confusion : TP={tp}  FP={fp}  FN={fn}  TN={tn}")
 
 
